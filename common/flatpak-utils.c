@@ -41,6 +41,7 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
+#include <sys/apparmor.h>
 
 #include <glib.h>
 #include "libglnx/libglnx.h"
@@ -1645,6 +1646,51 @@ ensure_app_ids (void)
                                      NULL, (GDestroyNotify) app_info_free);
 }
 
+/* Returns NULL if the security label doesn't indicate that this is a
+ * snap confined application */
+static GKeyFile *
+parse_app_id_from_security_label (const char *security_label)
+{
+  static int apparmor_enabled = -1;
+  g_autofree char *security_label_copy = NULL;
+  char *label, *dot;
+  g_autofree char *snap_name = NULL;
+  g_autofree char *app_id = NULL;
+  g_autoptr(GKeyFile) metadata = NULL;
+
+  if (apparmor_enabled < 0)
+    apparmor_enabled = aa_is_enabled();
+
+  /* Snap confinement requires AppArmor */
+  if (!apparmor_enabled)
+    return NULL;
+
+  /* Parse the security label as an AppArmor context.  We take a copy
+   * of the string because aa_splitcon modifies its argument. */
+  security_label_copy = g_strdup (security_label);
+  label = aa_splitcon (security_label_copy, NULL);
+  if (!label)
+    return NULL;
+
+  /* If the label belongs to a snap, it will be of the form
+   * snap.$PACKAGE.$APPLICATION.  We want to extract the package
+   * name */
+  if (!g_str_has_prefix (label, "snap."))
+    return NULL;
+
+  label += 5;
+  dot = strchr (label, '.');
+  if (!dot)
+    return NULL;
+  snap_name = g_strndup (label, dot - label);
+  app_id = g_strconcat ("snap.pkg.", snap_name, NULL);
+
+  metadata = g_key_file_new ();
+  g_key_file_set_value (metadata, "Application", "name", app_id);
+
+  return g_steal_pointer (&metadata);
+}
+
 /* Returns NULL on failure, keyfile with name "" if not sandboxed, and full app-info otherwise */
 static GKeyFile *
 parse_app_id_from_fileinfo (int pid)
@@ -1722,11 +1768,28 @@ got_credentials_cb (GObject      *source_object,
   if (!info->exited && reply != NULL)
     {
       GVariant *body = g_dbus_message_get_body (reply);
-      guint32 pid;
+      g_autoptr(GVariantIter) iter = NULL;
+      const char *key;
+      GVariant *value = NULL;
+      guint32 pid = 0;
+      g_autofree char *security_label = NULL;
 
-      g_variant_get (body, "(u)", &pid);
+      g_variant_get (body, "(a{sv})", &iter);
+      while (g_variant_iter_loop (iter, "{&sv}", &key, &value))
+        {
+          if (strcmp (key, "ProcessID") == 0)
+            pid = g_variant_get_uint32 (value);
+          else if (strcmp (key, "LinuxSecurityLabel") == 0)
+            {
+              g_clear_pointer (&security_label, g_free);
+              security_label = g_variant_dup_bytestring (value, NULL);
+            }
+        }
 
-      info->app_info = parse_app_id_from_fileinfo (pid);
+      if (security_label != NULL)
+        info->app_info = parse_app_id_from_security_label (security_label);
+      if (info->app_info == NULL)
+        info->app_info = parse_app_id_from_fileinfo (pid);
     }
 
   for (l = info->pending; l != NULL; l = l->next)
@@ -1783,7 +1846,7 @@ flatpak_invocation_lookup_app_info (GDBusMethodInvocation *invocation,
           g_autoptr(GDBusMessage) msg = g_dbus_message_new_method_call ("org.freedesktop.DBus",
                                                                         "/org/freedesktop/DBus",
                                                                         "org.freedesktop.DBus",
-                                                                        "GetConnectionUnixProcessID");
+                                                                        "GetConnectionCredentials");
           g_dbus_message_set_body (msg, g_variant_new ("(s)", sender));
 
           g_dbus_connection_send_message_with_reply (connection, msg,
